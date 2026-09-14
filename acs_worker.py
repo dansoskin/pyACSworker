@@ -1,15 +1,40 @@
+"""ACS controller worker, usable two ways.
+
+Thread mode::
+
+    acs = MyController()
+    acs.start()             # run() drives tick() on its own thread
+    ...
+    acs.stop()
+
+Superloop mode::
+
+    acs = MyController()    # never call start()
+    while running:
+        acs.tick()          # one pass, never blocks
+        time.sleep(0.010)
+    acs.stop()
+
+Both modes execute the same per-pass work; only the caller and the rate differ.
+Pick one: tick() refuses to run on a foreign thread once start() has been
+called, because two threads sharing one comm handle interleave.
+
+Subclasses override child_loop() and nothing else.
+"""
+
 import SPiiPlusPython as sp
 import threading
 import time
 import logging
 import queue
 
-import math
-
 
 class ACSController(threading.Thread):
 
-    def __init__(self, ip_address: str = "10.0.0.100", port: int = 701):
+    def __init__(self, ip_address: str = "10.0.0.100", port: int = 701,
+                 reconnect_interval: float = 5.0,
+                 period: float = 0.001,
+                 idle_period: float = 0.1):
         self.ip_address = ip_address
         self.port = port
         self.handle = None  # Will store the communication handle
@@ -19,38 +44,58 @@ class ACSController(threading.Thread):
         self.logger = logging.getLogger('__main__.'+__name__)
         self.logger.info("acs initialized")
         self.output_queue = queue.Queue()
-        # Controller calls queued by other threads, drained by run() on this
-        # thread. See queue_command().
+        # Controller calls queued by other threads, drained by tick() on
+        # whichever thread owns the loop. See queue_command().
         self.command_queue = queue.Queue()
 
+        # Pacing. period and idle_period apply to thread mode only -- a
+        # superloop caller sets its own rate by how often it calls tick().
+        self.reconnect_interval = reconnect_interval
+        self.period = period
+        self.idle_period = idle_period
+
+        self._clock = time.monotonic
+        self._shutdown = threading.Event()
+        self._connecting = False      # a connect attempt is in flight
+        self._next_attempt = 0.0      # monotonic deadline for the next one
+
     def connect(self) -> bool:
-        print(f"Attempting to connect to controller at {self.ip_address}:{self.port}...")
+        self.logger.info(f"acs connecting to {self.ip_address}:{self.port}")
         try:
             # Open the communication channel via TCP/IP
             # The handle is stored in self.handle for use in other functions
             self.handle = sp.OpenCommEthernetTCP(self.ip_address, self.port)
             if  self.handle == -1:
-                self.logger.info(f"acs failed to connect to {self.ip_address}:{self.port}, error code: {sp.GetLastError()}")
+                self.logger.warning(f"acs failed to connect to {self.ip_address}:{self.port}, error code: {sp.GetLastError()}")
                 self.is_connected = False
                 self.handle = None
             else:
                 self.logger.info(f"ACS driver connected to {self.ip_address} successfully")
                 self.is_connected = True
-        
+
         except Exception as err:
-            self.logger.info(f"acs failed to connect with error: {err}")
+            self.logger.warning(f"acs failed to connect with error: {err}")
             self.is_connected = False
             self.handle = None
 
+        return self.is_connected
+
     def disconnect(self):
-        if self.is_connected:
-            print("Disconnecting from controller...")
+        if not self.is_connected:
+            self.logger.debug("acs already disconnected")
+            return
+
+        self.logger.info("acs disconnecting")
+        try:
             sp.CloseComm(self.handle)
+        except Exception as err:
+            self.logger.warning(f"acs CloseComm failed: {err}")
+        finally:
+            # Cleared either way: a handle we cannot close is not a handle we
+            # can keep using, and tick() has to be able to reconnect.
             self.handle = None
             self.is_connected = False
-            print("Disconnected.")
-        else:
-            print("Already disconnected.")
+        self.logger.info("acs disconnected")
 
     #------------------------------------------------------------
 
@@ -65,27 +110,27 @@ class ACSController(threading.Thread):
             str | None: The controller's response string, or None if an error occurs.
             """
         if not self.is_connected:
-            print("Error: Not connected to the controller.")
+            self.logger.warning(f"cannot execute '{command_str}': not connected")
             return None
         try:
             # Use Transaction to send a command and receive a reply.
             reply = sp.Transaction(self.handle, command_str)
-            
+
             # Check if reply is an AcsError object
             if hasattr(reply, '__class__') and 'AcsError' in str(type(reply)):
-                print(f"Error executing command '{command_str}': {reply}")
+                self.logger.warning(f"error executing command '{command_str}': {reply}")
                 return None
-            
+
             # The reply often includes a newline character, so we strip it.
             if isinstance(reply, str):
                 return reply.strip()
             else:
-                print(f"Unexpected reply type for command '{command_str}': {type(reply)}")
+                self.logger.warning(f"unexpected reply type for command '{command_str}': {type(reply)}")
                 return None
         except Exception as e:
-            print(f"Error executing command '{command_str}': {e}")
+            self.logger.warning(f"error executing command '{command_str}': {e}")
             return None
-    
+
     def read_scalar(self, var_name: str, var_type: str, nbuf: int = sp.ACSC_NONE) -> int | float | None:
         """Read a scalar ACS variable over the binary interface.
 
@@ -141,18 +186,21 @@ class ACSController(threading.Thread):
         return True
 
     def queue_command(self, func, *args, **kwargs) -> None:
-        """Queue a controller call for execution on the ACS thread.
+        """Queue a controller call for execution on the loop-owning thread.
 
         The SDK serializes calls per communication handle, so calling it from
         another thread works but blocks that thread until the handle is free --
         and a multi-call sequence could still be interleaved unless it is
-        wrapped in CaptureComm/ReleaseComm. Keeping every call on this one
-        thread avoids both problems: producers only enqueue, and run() drains.
+        wrapped in CaptureComm/ReleaseComm. Keeping every call on one thread
+        avoids both problems: producers only enqueue, and tick() drains.
+
+        Useful in both modes. In superloop mode the drain happens on whichever
+        thread calls tick().
         """
         self.command_queue.put_nowait((func, args, kwargs))
 
     def drain_commands(self) -> None:
-        """Execute every queued call. Runs on the ACS thread, from run()."""
+        """Execute every queued call. Runs on the loop-owning thread, from tick()."""
         while True:
             try:
                 func, args, kwargs = self.command_queue.get_nowait()
@@ -164,24 +212,94 @@ class ACSController(threading.Thread):
                 name = getattr(func, "__name__", repr(func))
                 self.logger.error(f"queued command {name} failed: {e}")
 
+    #------------------------------------------------------------
+
+    def _service_reconnect(self) -> None:
+        """Start a connect attempt if one is due and none is already running.
+
+        The attempt runs on a throwaway thread because OpenCommEthernetTCP
+        blocks: a TCP connect to a powered-down controller can stall for
+        seconds, which a superloop caller cannot afford inside its tick.
+        """
+        if self._connecting or self._clock() < self._next_attempt:
+            return
+        self._connecting = True
+        threading.Thread(target=self._attempt_connect, daemon=True,
+                         name=f"acs-connect-{self.ip_address}").start()
+
+    def _attempt_connect(self) -> None:
+        try:
+            self.connect()
+            if self._shutdown.is_set() and self.is_connected:
+                # Shutdown landed while the connect was in flight -- do not leak
+                # the handle we just opened.
+                self.disconnect()
+        finally:
+            # Deadline set before the flag clears, so a failed attempt cannot
+            # re-fire on the very next tick.
+            self._next_attempt = self._clock() + self.reconnect_interval
+            self._connecting = False
+
     def child_loop(self):
         pass
 
+    def tick(self) -> bool:
+        """One pass of servicing. Never blocks.
+
+        Reconnects if the link is down, otherwise drains the command queue and
+        runs child_loop(). Returns True when child_loop() ran.
+
+        Call this from your own loop in superloop mode; run() calls it for you
+        in thread mode.
+        """
+        if self.is_alive() and threading.current_thread() is not self:
+            raise RuntimeError(
+                "tick() called from outside the worker thread -- use start() or "
+                "tick(), not both: two threads on one comm handle interleave")
+
+        if self._shutdown.is_set():
+            # stop() is final. Without this a superloop that ticks once more on
+            # its way out would re-open the link it just closed.
+            return False
+
+        if not self.is_connected:
+            self._service_reconnect()
+            return False
+
+        try:
+            self.drain_commands()
+            self.child_loop()
+        except Exception as e:
+            self.logger.error(f"error in child_loop (disconnecting): {e}")
+            self.disconnect()
+            return False
+        return True
+
     def run(self):
-        self.connect()
-        while True:
-            if not self.is_connected:
-                time.sleep(5)
-                self.connect()
-                continue
+        while not self._shutdown.is_set():
+            if self.tick():
+                # time.sleep, NOT _shutdown.wait: on Windows Event.wait floors at
+                # the ~15.6 ms scheduler tick regardless of the timeout asked for,
+                # which would cap servicing near 65 Hz. time.sleep uses a
+                # high-resolution timer (a 1 ms request measures ~1.5 ms).
+                # Either way the GIL is released, so other threads run.
+                time.sleep(self.period)
+            else:
+                # Link is down, nothing to service: trade that resolution for a
+                # prompt stop(), since wait() returns the moment the event is set.
+                self._shutdown.wait(self.idle_period)
+        self.disconnect()
 
-            try:
-                self.drain_commands()
-                self.child_loop()
-            except Exception as e:
-                self.logger.error(f"error in child_loop (disconnecting): {e}")
-                self.disconnect()
-                continue
+    def stop(self, timeout: float | None = 2.0) -> None:
+        """Shut down and close the link. Works in both modes.
 
-            time.sleep(0.001)
-
+        Thread mode joins the worker, which disconnects on its way out.
+        Superloop mode (start() never called) disconnects here.
+        """
+        self._shutdown.set()
+        if threading.current_thread() is self:
+            return          # called from child_loop(); run() disconnects as it unwinds
+        if self.is_alive():
+            self.join(timeout)
+        else:
+            self.disconnect()
