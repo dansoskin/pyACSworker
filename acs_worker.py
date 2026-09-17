@@ -185,6 +185,104 @@ class ACSController(threading.Thread):
             return False
         return True
 
+    def read_array(self, var_name: str, var_type: str, count: int,
+                   first: int = 0, nbuf: int = sp.ACSC_NONE) -> list | None:
+        """Read `count` elements of a one-dimensional ACS array.
+
+        The array sibling of read_scalar -- and the SDK has no separate array call:
+        ReadInteger/ReadReal become an array read purely by being handed a real index
+        range where read_scalar passes ACSC_NONE. The whole range travels in one
+        transaction, which is the point: one round trip instead of `count` of them.
+
+        Reads indices first..first+count-1 inclusive. The library offers no way to ask
+        how long an array is, so `count` is the caller's business; asking for more than
+        the array holds is a controller error, not a short read.
+
+        Returns a plain list of int/float -- the SDK hands back a numpy array, and a
+        bare scalar when the range is a single element; both are normalised here so
+        callers need no numpy. Returns None if not connected, on an unknown type, on a
+        controller error, or if the reply is not `count` values long. That last case is
+        None rather than a short list on purpose: callers unpack the result positionally
+        and already treat None as "keep the last known value".
+        """
+        if not self.is_connected:
+            self.logger.warning(f"cannot read '{var_name}': not connected")
+            return None
+        if count < 1 or first < 0:
+            self.logger.error(f"cannot read '{var_name}': bad range first={first} count={count}")
+            return None
+
+        last = first + count - 1  # the SDK's index range is inclusive at both ends
+        if var_type == 'int':
+            reply = sp.ReadInteger(self.handle, nbuf, var_name,
+                                   first, last, sp.ACSC_NONE, sp.ACSC_NONE)
+        elif var_type == 'float':
+            reply = sp.ReadReal(self.handle, nbuf, var_name,
+                                first, last, sp.ACSC_NONE, sp.ACSC_NONE)
+        else:
+            self.logger.error(f"unsupported variable type '{var_type}' for '{var_name}'")
+            return None
+
+        # The SDK returns an AcsError object on failure rather than raising.
+        if isinstance(reply, sp.AcsError):
+            self.logger.warning(
+                f"failed to read '{var_name}[{first}..{last}]': error {sp.GetLastError()}")
+            return None
+
+        if hasattr(reply, 'tolist'):        # numpy array, the documented array return
+            values = reply.tolist()
+        elif isinstance(reply, (list, tuple)):
+            values = list(reply)
+        else:                               # a one-element range came back unwrapped
+            values = [reply]
+
+        if len(values) != count:
+            self.logger.warning(
+                f"read '{var_name}[{first}..{last}]' returned {len(values)} values, "
+                f"expected {count}")
+            return None
+        return values
+
+    def write_array(self, var_name: str, var_type: str, values,
+                    first: int = 0, nbuf: int = sp.ACSC_NONE) -> bool:
+        """Write a one-dimensional ACS array. Mirror of read_array.
+
+        `values` is any sequence; its length is the count, so there is no separate
+        argument to keep in step with it. Writes indices first..first+len(values)-1
+        inclusive in one transaction. Returns True on success, False otherwise.
+
+        Like write_scalar, elements are coerced to the requested type, so a value that
+        is not a number raises rather than returning False.
+        """
+        if not self.is_connected:
+            self.logger.warning(f"cannot write '{var_name}': not connected")
+            return False
+
+        values = list(values)
+        if not values or first < 0:
+            self.logger.error(
+                f"cannot write '{var_name}': bad range first={first} count={len(values)}")
+            return False
+
+        last = first + len(values) - 1
+        if var_type == 'int':
+            reply = sp.WriteInteger(self.handle, nbuf, var_name,
+                                    first, last, sp.ACSC_NONE, sp.ACSC_NONE,
+                                    [int(v) for v in values])
+        elif var_type == 'float':
+            reply = sp.WriteReal(self.handle, nbuf, var_name,
+                                 first, last, sp.ACSC_NONE, sp.ACSC_NONE,
+                                 [float(v) for v in values])
+        else:
+            self.logger.error(f"unsupported variable type '{var_type}' for '{var_name}'")
+            return False
+
+        if isinstance(reply, sp.AcsError):
+            self.logger.warning(
+                f"failed to write '{var_name}[{first}..{last}]': error {sp.GetLastError()}")
+            return False
+        return True
+
     def queue_command(self, func, *args, **kwargs) -> None:
         """Queue a controller call for execution on the loop-owning thread.
 

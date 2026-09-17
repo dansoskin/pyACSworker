@@ -92,6 +92,8 @@ survives a power cycle, so re-push any settings when `is_connected` goes true.
 | `is_connected` | Link state. |
 | `read_scalar(name, 'int'\|'float')` | Binary read. `None` on failure. |
 | `write_scalar(name, type, value)` | Binary write. `False` on failure. |
+| `read_array(name, type, count, first=0)` | Binary read of `count` elements, one transaction. `list` or `None`. |
+| `write_array(name, type, values, first=0)` | Binary write of a sequence, one transaction. `False` on failure. |
 | `execute_command("?VERSION")` | Raw ACSPL+ transaction, returns `str` or `None`. |
 | `queue_command(fn, *args)` | Run `fn` on the loop thread on the next pass. |
 
